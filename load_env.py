@@ -22,7 +22,8 @@ def parse_env_file(path):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            values[key.strip()] = val.strip()
+            val = val.strip().strip('"').strip("'")
+            values[key.strip()] = val
     return values
 
 env_path = os.path.join(os.getcwd(), ".env")
@@ -47,6 +48,11 @@ for key, val in values.items():
     if val.lstrip("-").isdigit():
         env.Append(CPPDEFINES=[(key, val)])
     else:
-        env.Append(CPPDEFINES=[(key, env.StringifyMacro(val))])
+        # Escape characters that are special in C strings or in SCons substitution:
+        #   \  →  \\    (C string escape)
+        #   "  →  \"    (C string escape)
+        #   $  →  $$$$  (escape for $)
+        c_val = val.replace('\\', '\\\\').replace('"', '\\"').replace('$', '$$$$')
+        env.Append(CPPDEFINES=[(key, env.StringifyMacro(c_val))])
 
 print("[load_env] loaded {} values from .env".format(len(values)))
