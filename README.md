@@ -29,15 +29,25 @@ A ESP32 device with Wifi and BLE Bluetooth support. Tested it with a *ESP32-PICO
 
 ## Installation
 
-The package is based on PlatformIO. To build run:
+The package is based on PlatformIO. To build and upload via USB run:
 
 
     pio run --target upload && pio device monitor
+
+or
+
+    pio run -e usb --target upload && pio device monitor -e usb 
+
+To build and update via telnet run:
+
+    pio run -e wifi --target upload && pio device monitor -e wifi
 
 
 ## Configuration
 
 Copy `.env.sample` to `.env` and edit the configuration settings to suit your local setup. The access code is the same code used to connect with the *ChlorinatorGO* smartphone app and can be found in the chlorinators' maintenance menu.
+
+Configure `target` in section `[env:wifi]` in file `platformio.ini` to match IP address and port of the ESP board for Wifi OTA update and minitoring.
 
 
 ## Operation
