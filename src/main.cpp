@@ -11,7 +11,7 @@
  *  - Subscribes to chlorinator/<name>/action for commands (integer 0-13)
  *  - Publishes Home Assistant MQTT Discovery config on (re)connect
  *
- * Development tools (single TCP port 80):
+ * Development tools (single TCP port 23):
  *  - pio device monitor  → streams log output as plain text
  *  - pio run -t upload   → tools/ota_upload.py pushes firmware via "OTA <size>\n" protocol
  *
@@ -35,8 +35,8 @@
 #include "crypto.h"
 #include "chlorinator.h"
 
-// ─── Log / OTA server (port 80, single TCP connection) ───────────────────────
-static WiFiServer s_log_server(80);
+// ─── Log / OTA server (port 23, single TCP connection) ───────────────────────
+static WiFiServer s_log_server(23);
 static WiFiClient s_log_client;
 
 // ─── MQTT Topic Strings (built from CHLORINATOR_NAME at startup) ──────────────
@@ -682,7 +682,7 @@ void loop() {
     static bool s_server_started = false;
     if (!s_server_started) {
         s_log_server.begin();
-        tlog("[SYS] log/OTA server on port 80\n");
+        tlog("[SYS] log/OTA server on port 23\n");
         s_server_started = true;
     }
 
