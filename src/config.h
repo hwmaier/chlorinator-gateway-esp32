@@ -40,4 +40,4 @@
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
 #define POLL_INTERVAL_MS  10000   // Milliseconds between state reads
-#define BLE_SCAN_DURATION     10  // BLE scan timeout in seconds
+#define BLE_SCAN_DURATION   5000  // BLE scan timeout in milliseconds (NimBLE v2 uses ms)

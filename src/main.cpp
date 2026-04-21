@@ -324,13 +324,14 @@ static bool ble_operate(ChlorinatorAction action) {
         pScan->setActiveScan(true);
         pScan->setInterval(100);
         pScan->setWindow(99);
-        pScan->start(BLE_SCAN_DURATION, /*is_continue=*/false);
-        NimBLEScanResults results = pScan->getResults();
+        NimBLEScanResults results = pScan->getResults(BLE_SCAN_DURATION, /*is_continue=*/false);
+        tlog("[BLE] scan complete, %d device(s) found\n", results.getCount());
 
         for (int i = 0; i < results.getCount(); i++) {
             const NimBLEAdvertisedDevice *dev = results.getDevice(i);
             String addr = String(dev->getAddress().toString().c_str());
             String name = String(dev->getName().c_str());
+            tlog("[BLE]   %s  \"%s\"\n", addr.c_str(), name.c_str());
 
             bool match_mac  = !String(CHLORINATOR_MAC).isEmpty() &&
                                addr.equalsIgnoreCase(CHLORINATOR_MAC);
@@ -353,7 +354,7 @@ static bool ble_operate(ChlorinatorAction action) {
 
     // ── 2. Connect ─────────────────────────────────────────────────────────
     NimBLEClient *pClient = NimBLEDevice::createClient();
-    pClient->setConnectTimeout(15);  // seconds
+    pClient->setConnectTimeout(15000);  // milliseconds (NimBLE v2 uses ms)
 
     tlog("[BLE] connecting to %s ...\n", g_ble_address.toString().c_str());
     bool connected = pClient->connect(g_ble_address);
@@ -463,9 +464,9 @@ disconnect:
     pClient->disconnect();
     NimBLEDevice::deleteClient(pClient);
 
-    if (!success) {
-        g_has_ble_address = false;  // Force re-scan on next attempt
-    }
+    // Always re-scan next time: the chlorinator needs time to restart advertising
+    // after disconnect, so connecting to a cached address without scanning first fails.
+    g_has_ble_address = false;
     return success;
 }
 
