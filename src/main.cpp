@@ -408,9 +408,8 @@ static bool ble_operate(ChlorinatorAction action) {
         }
         const uint8_t *session_key = (const uint8_t *)sk_raw.data();
 
-        char sk_hex[33] = {};
-        for (int i = 0; i < 16; i++) snprintf(sk_hex + i * 2, 3, "%02x", session_key[i]);
-        tlog("[BLE] session key: %s\n", sk_hex);
+        tlog("[BLE] session key: %02x%02x%02x...%02x\n",
+             session_key[0], session_key[1], session_key[2], session_key[15]);
 
         // ── 5. Authenticate ────────────────────────────────────────────────
         NimBLERemoteCharacteristic *pAuth = pSvc->getCharacteristic(UUID_MASTER_AUTHENTICATION);
