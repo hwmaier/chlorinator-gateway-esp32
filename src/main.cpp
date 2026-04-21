@@ -471,11 +471,11 @@ static bool ble_operate(ChlorinatorAction action) {
         g_has_state = true;
         success = true;
 
-        tlog("[BLE] state: mode=%d pump=%s cell=%s pH=%.1f\n",
+        tlog("[BLE] state: mode=%d priming=%s pump=%s cell=%s\n",
             g_state.mode,
+            g_state.pump_priming   ? "ON"  : "OFF",
             g_state.pump_operating ? "ON"  : "OFF",
-            g_state.cell_operating ? "ON"  : "OFF",
-            g_state.ph_measurement);
+            g_state.cell_operating ? "ON"  : "OFF");
     }
 
 disconnect:
