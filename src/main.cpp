@@ -51,7 +51,8 @@ static ChlorinatorState g_state;
 static bool             g_has_state       = false;
 static volatile int     g_pending_action  = ACTION_NO_ACTION;
 static volatile bool    g_ota_in_progress = false;
-static String           g_ble_address;   // Cached after first successful scan
+static NimBLEAddress    g_ble_address;     // Cached after first successful scan
+static bool             g_has_ble_address = false;
 
 // ─── MQTT & WiFi ──────────────────────────────────────────────────────────────
 static WiFiClient   s_wifi;
@@ -317,32 +318,34 @@ static void mqtt_reconnect() {
 static bool ble_operate(ChlorinatorAction action) {
 
     // ── 1. Scan if we don't have a cached address ──────────────────────────
-    if (g_ble_address.isEmpty()) {
+    if (!g_has_ble_address) {
         tlog("[BLE] scanning for %s ...\n", CHLORINATOR_MAC);
         NimBLEScan *pScan = NimBLEDevice::getScan();
         pScan->setActiveScan(true);
         pScan->setInterval(100);
         pScan->setWindow(99);
-        NimBLEScanResults results = pScan->start(BLE_SCAN_DURATION, /*is_async=*/false);
+        pScan->start(BLE_SCAN_DURATION, /*is_continue=*/false);
+        NimBLEScanResults results = pScan->getResults();
 
         for (int i = 0; i < results.getCount(); i++) {
-            NimBLEAdvertisedDevice dev = results.getDevice(i);
-            String addr = String(dev.getAddress().toString().c_str());
-            String name = String(dev.getName().c_str());
+            const NimBLEAdvertisedDevice *dev = results.getDevice(i);
+            String addr = String(dev->getAddress().toString().c_str());
+            String name = String(dev->getName().c_str());
 
             bool match_mac  = !String(CHLORINATOR_MAC).isEmpty() &&
                                addr.equalsIgnoreCase(CHLORINATOR_MAC);
             bool match_name = name.equals(CHLORINATOR_NAME);
 
             if (match_mac || match_name) {
-                g_ble_address = addr;
+                g_ble_address     = dev->getAddress();
+                g_has_ble_address = true;
                 tlog("[BLE] device found: %s (%s)\n", addr.c_str(), name.c_str());
                 break;
             }
         }
         pScan->clearResults();
 
-        if (g_ble_address.isEmpty()) {
+        if (!g_has_ble_address) {
             tlog("[BLE] device not found\n");
             return false;
         }
@@ -352,12 +355,12 @@ static bool ble_operate(ChlorinatorAction action) {
     NimBLEClient *pClient = NimBLEDevice::createClient();
     pClient->setConnectTimeout(15);  // seconds
 
-    tlog("[BLE] connecting to %s ...\n", g_ble_address.c_str());
-    bool connected = pClient->connect(NimBLEAddress(g_ble_address.c_str()));
+    tlog("[BLE] connecting to %s ...\n", g_ble_address.toString().c_str());
+    bool connected = pClient->connect(g_ble_address);
     if (!connected) {
         tlog("[BLE] connection failed\n");
         NimBLEDevice::deleteClient(pClient);
-        g_ble_address = "";   // Force re-scan next time
+        g_has_ble_address = false;   // Force re-scan next time
         return false;
     }
     tlog("[BLE] connected\n");
@@ -461,7 +464,7 @@ disconnect:
     NimBLEDevice::deleteClient(pClient);
 
     if (!success) {
-        g_ble_address = "";  // Force re-scan on next attempt
+        g_has_ble_address = false;  // Force re-scan on next attempt
     }
     return success;
 }
@@ -488,7 +491,6 @@ static void handle_ota(size_t fw_size) {
     }
 
     s_log_client.println("READY");
-    s_log_client.flush();
 
     uint8_t buf[512];
     size_t  written    = 0;
@@ -527,7 +529,6 @@ static void handle_ota(size_t fw_size) {
     if (Update.end(true)) {
         tlog("[OTA] complete, rebooting\n");
         s_log_client.println("OK");
-        s_log_client.flush();
         delay(200);
         ESP.restart();
     } else {
@@ -547,7 +548,7 @@ static void service_log_server() {
         if (s_log_client && s_log_client.connected()) {
             s_log_client.stop();
         }
-        s_log_client = s_log_server.available();
+        s_log_client = s_log_server.accept();
         tlog("[SYS] log client connected\n");
     }
 
@@ -586,6 +587,11 @@ static void service_log_server() {
 
 void setup() {
     Serial.begin(115200);
+
+    // XIAO ESP32C6: GPIO14 selects antenna — HIGH = external u.FL, LOW = built-in ceramic
+    pinMode(14, OUTPUT);
+    digitalWrite(14, HIGH);
+
     delay(500);
     tlog("\n[SYS] Chlorinator BLE/MQTT Gateway (ESP32) starting\n");
 
