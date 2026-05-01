@@ -1,9 +1,7 @@
 /*
  * ESP32 BLE-to-MQTT Gateway for Astral Pool Viron eQuilibrium Chlorinator
  *
- * Direct C++ port of ble2mqtt.py for improved reliability on ESP32.
- *
- * Behaviour mirrors the Python version:
+ * Behaviour:
  *  - Scans/connects to the chlorinator by BLE MAC address
  *  - Authenticates using the device access code
  *  - Reads encrypted state every POLL_INTERVAL_MS milliseconds
@@ -11,12 +9,16 @@
  *  - Subscribes to chlorinator/<name>/action for commands (integer 0-13)
  *  - Publishes Home Assistant MQTT Discovery config on (re)connect
  *
+ * Architecture: two FreeRTOS tasks
+ *  - loop()    — WiFi, MQTT, log/OTA server, LED heartbeat, state publishing
+ *  - ble_task  — BLE scan/connect/auth/read, posts results via queue
+ *
  * Development tools (single TCP port 23):
  *  - pio device monitor  → streams log output as plain text
  *  - pio run -t upload   → tools/ota_upload.py pushes firmware via "OTA <size>\n" protocol
  *
  * Dependencies (platformio.ini):
- *   h2zero/NimBLE-Arduino @ ^1.4.1
+ *   h2zero/NimBLE-Arduino @ ^2.0
  *   knolleary/PubSubClient @ ^2.8
  *   bblanchon/ArduinoJson  @ ^7.0
  */
@@ -27,6 +29,7 @@
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <atomic>
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
@@ -34,6 +37,9 @@
 #include "config.h"
 #include "crypto.h"
 #include "chlorinator.h"
+
+// XIAO ESP32C6: user LED on GPIO15, active low
+#define PIN_LED 15
 
 // ─── Log / OTA server (port 23, single TCP connection) ───────────────────────
 static WiFiServer s_log_server(23);
@@ -46,32 +52,38 @@ static char s_topic_action[80];
 static char s_topic_discovery[128];
 static char s_device_id[48];
 
-// ─── Global State ─────────────────────────────────────────────────────────────
-static ChlorinatorState g_state;
-static bool             g_has_state       = false;
-static volatile int     g_pending_action  = ACTION_NO_ACTION;
-static volatile bool    g_ota_in_progress = false;
-static NimBLEAddress    g_ble_address;     // Cached after first successful scan
-static bool             g_has_ble_address = false;
+// ─── Inter-task synchronisation ───────────────────────────────────────────────
+static SemaphoreHandle_t  g_log_mutex;
+static QueueHandle_t      g_action_queue;        // int (ChlorinatorAction), depth 1: MQTT → BLE task
+static QueueHandle_t      g_state_queue;         // ChlorinatorState, depth 1: BLE task → loop
+static std::atomic<bool>  g_mqtt_connected{false};
+static std::atomic<bool>  g_ota_in_progress{false};
+static TaskHandle_t       g_ble_task_handle = nullptr;
+
+// ─── BLE address cache (BLE task only) ───────────────────────────────────────
+static NimBLEAddress g_ble_address;
+static bool          g_has_ble_address = false;
 
 // ─── MQTT & WiFi ──────────────────────────────────────────────────────────────
 static WiFiClient   s_wifi;
 static PubSubClient s_mqtt(s_wifi);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Logging — writes to USB Serial and the connected TCP log client (if any)
+// Logging — mutex-protected so both tasks can call safely
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void tlog(const char *fmt, ...) {
-    char buf[256];
+    char buf[128];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    xSemaphoreTake(g_log_mutex, portMAX_DELAY);
     Serial.print(buf);
     if (s_log_client && s_log_client.connected()) {
         s_log_client.print(buf);
     }
+    xSemaphoreGive(g_log_mutex);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,26 +103,26 @@ static void str_to_lower(const char *src, char *dst, size_t dst_len) {
 // MQTT: state JSON publishing
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void publish_state() {
-    if (!s_mqtt.connected() || !g_has_state) return;
+static void publish_state(const ChlorinatorState &state) {
+    if (!s_mqtt.connected()) return;
 
     JsonDocument doc;
-    doc["mode"]                                   = (int)g_state.mode;
-    doc["pump_speed"]                             = (int)g_state.pump_speed;
-    doc["active_timer"]                           = g_state.active_timer;
-    doc["info_message"]                           = info_message_name(g_state.info_message);
-    doc["ph_measurement"]                         = g_state.ph_measurement;
-    doc["chlorine_control_status"]                = (int)g_state.chlorine_status;
-    doc["chemistry_values_current"]               = g_state.chemistry_current;
-    doc["chemistry_values_valid"]                 = g_state.chemistry_valid;
-    doc["time_hours"]                             = g_state.time_hours;
-    doc["time_minutes"]                           = g_state.time_minutes;
-    doc["time_seconds"]                           = g_state.time_seconds;
-    doc["spa_selection"]                          = g_state.spa_selection;
-    doc["pump_is_priming"]                        = g_state.pump_priming;
-    doc["pump_is_operating"]                      = g_state.pump_operating;
-    doc["cell_is_operating"]                      = g_state.cell_operating;
-    doc["sanitising_until_next_timer_tomorrow"]   = g_state.sanitising_tomorrow;
+    doc["mode"]                                   = (int)state.mode;
+    doc["pump_speed"]                             = (int)state.pump_speed;
+    doc["active_timer"]                           = state.active_timer;
+    doc["info_message"]                           = info_message_name(state.info_message);
+    doc["ph_measurement"]                         = state.ph_measurement;
+    doc["chlorine_control_status"]                = (int)state.chlorine_status;
+    doc["chemistry_values_current"]               = state.chemistry_current;
+    doc["chemistry_values_valid"]                 = state.chemistry_valid;
+    doc["time_hours"]                             = state.time_hours;
+    doc["time_minutes"]                           = state.time_minutes;
+    doc["time_seconds"]                           = state.time_seconds;
+    doc["spa_selection"]                          = state.spa_selection;
+    doc["pump_is_priming"]                        = state.pump_priming;
+    doc["pump_is_operating"]                      = state.pump_operating;
+    doc["cell_is_operating"]                      = state.cell_operating;
+    doc["sanitising_until_next_timer_tomorrow"]   = state.sanitising_tomorrow;
 
     size_t len = measureJson(doc);
     char *buf = (char *)malloc(len + 1);
@@ -136,12 +148,9 @@ static void publish_error(const char *msg) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void publish_autodiscovery() {
-    // Build the full discovery document using heap-allocated buffers to avoid
-    // blowing the stack. The serialised payload is typically 1.5–2 KB.
     JsonDocument doc;
 
-    // Device metadata
-    JsonObject dev  = doc["dev"].to<JsonObject>();
+    JsonObject dev = doc["dev"].to<JsonObject>();
     dev["ids"]  = s_device_id;
     char dev_name[48];
     snprintf(dev_name, sizeof(dev_name), "Chlorinator %s", CHLORINATOR_NAME);
@@ -149,17 +158,15 @@ static void publish_autodiscovery() {
     dev["mf"]   = "Open Source";
     dev["mdl"]  = "MQTT Gateway for Astral Pool";
 
-    // Origin / bridge info
     JsonObject origin = doc["o"].to<JsonObject>();
     origin["name"] = "chlorinator-gateway-esp32";
-    origin["url"]  = "https://github.com/hwmaier/chlorinator-gateway";
+    origin["url"]  = "https://github.com/hwmaier/chlorinator-gateway-esp32";
 
     doc["state_topic"] = s_topic_state;
     doc["qos"]         = 1;
 
     JsonObject cmps = doc["cmps"].to<JsonObject>();
 
-    // Helper: add a sensor component
     auto add_sensor = [&](const char *key, const char *name, const char *vt,
                           const char *dev_class = nullptr, bool enabled = true) {
         JsonObject c = cmps[key].to<JsonObject>();
@@ -173,7 +180,6 @@ static void publish_autodiscovery() {
         if (!enabled)  c["enabled_by_default"] = false;
     };
 
-    // Helper: add a binary_sensor component
     auto add_binary = [&](const char *key, const char *name, const char *vt,
                           const char *dev_class = nullptr) {
         JsonObject c = cmps[key].to<JsonObject>();
@@ -226,7 +232,6 @@ static void publish_autodiscovery() {
     add_sensor("spa_selection", "Spa Selection",
         "{{ value_json.spa_selection }}", nullptr, false);
 
-    // Action select entity
     {
         JsonObject c = cmps["action"].to<JsonObject>();
         c["name"]          = "Action";
@@ -252,7 +257,6 @@ static void publish_autodiscovery() {
         opts.add("Reset statistics");
         opts.add("Trigger cell reversal");
 
-        // Map display option → integer action sent to command_topic
         c["command_template"] =
             "{% set map = {"
             "'No action':0,'Off':1,'Automatic':2,'Manual':3,"
@@ -264,7 +268,6 @@ static void publish_autodiscovery() {
             "} %}{{ map[value] }}";
     }
 
-    // Serialise and publish with retain=true
     size_t len = measureJson(doc);
     char *buf = (char *)malloc(len + 1);
     if (!buf) {
@@ -282,7 +285,6 @@ static void publish_autodiscovery() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void on_mqtt_message(char *topic, byte *payload, unsigned int length) {
-    // Payload should be a decimal integer string, e.g. "2"
     char buf[16];
     if (length == 0 || length >= sizeof(buf)) return;
     memcpy(buf, payload, length);
@@ -290,7 +292,7 @@ static void on_mqtt_message(char *topic, byte *payload, unsigned int length) {
 
     int action = atoi(buf);
     if (action >= ACTION_NO_ACTION && action <= ACTION_TRIGGER_CELL_REVERSAL) {
-        g_pending_action = action;
+        xQueueOverwrite(g_action_queue, &action);
         tlog("[MQTT] action received: %d\n", action);
     } else {
         tlog("[MQTT] unknown action payload: '%s'\n", buf);
@@ -320,8 +322,6 @@ static void mqtt_reconnect() {
 // BLE: scan, connect, authenticate, read state, optionally write action
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Scans for the chlorinator and populates g_ble_address / g_has_ble_address.
-// Returns true if the device was found.
 static bool ble_scan() {
     tlog("[BLE] scanning for %s ...\n", CHLORINATOR_MAC);
     NimBLEScan *pScan = NimBLEDevice::getScan();
@@ -354,18 +354,15 @@ static bool ble_scan() {
     return false;
 }
 
-// Returns true on success and populates g_state.
-// On failure clears g_ble_address so the next call will re-scan.
-static bool ble_operate(ChlorinatorAction action) {
-
-    // ── 1. Ensure we have a cached address (scan only when needed) ─────────
+// Connects to the chlorinator, optionally sends an action, reads and decrypts
+// state into out_state. Returns true on success.
+static bool ble_operate(ChlorinatorAction action, ChlorinatorState *out_state) {
     if (!g_has_ble_address) {
         if (!ble_scan()) return false;
     }
 
-    // ── 2. Connect — on failure re-scan once and retry ─────────────────────
     NimBLEClient *pClient = NimBLEDevice::createClient();
-    pClient->setConnectTimeout(15000);  // milliseconds (NimBLE v2 uses ms)
+    pClient->setConnectTimeout(15000);
 
     tlog("[BLE] connecting to %s ...\n", g_ble_address.toString().c_str());
     bool connected = pClient->connect(g_ble_address);
@@ -374,8 +371,7 @@ static bool ble_operate(ChlorinatorAction action) {
         NimBLEDevice::deleteClient(pClient);
         g_has_ble_address = false;
         // Chlorinator may need a moment to restart advertising after a previous
-        // session disconnect — re-scan gives it that time implicitly (scan takes
-        // BLE_SCAN_DURATION ms) and refreshes the address type.
+        // session disconnect — re-scan gives it that time implicitly.
         if (!ble_scan()) return false;
 
         pClient = NimBLEDevice::createClient();
@@ -393,14 +389,12 @@ static bool ble_operate(ChlorinatorAction action) {
 
     bool success = false;
 
-    // ── 3. Get service ─────────────────────────────────────────────────────
     NimBLERemoteService *pSvc = pClient->getService(UUID_ASTRALPOOL_SERVICE);
     if (!pSvc) {
         tlog("[BLE] Astral Pool service not found\n");
         goto disconnect;
     }
 
-    // ── 4. Read session key ────────────────────────────────────────────────
     {
         NimBLERemoteCharacteristic *pSK = pSvc->getCharacteristic(UUID_SLAVE_SESSION_KEY);
         if (!pSK || !pSK->canRead()) {
@@ -418,7 +412,6 @@ static bool ble_operate(ChlorinatorAction action) {
         tlog("[BLE] session key: %02x%02x%02x...%02x\n",
              session_key[0], session_key[1], session_key[2], session_key[15]);
 
-        // ── 5. Authenticate ────────────────────────────────────────────────
         NimBLERemoteCharacteristic *pAuth = pSvc->getCharacteristic(UUID_MASTER_AUTHENTICATION);
         if (!pAuth || !pAuth->canWrite()) {
             tlog("[BLE] auth characteristic unavailable\n");
@@ -436,7 +429,6 @@ static bool ble_operate(ChlorinatorAction action) {
         }
         tlog("[BLE] authenticated\n");
 
-        // ── 6. Send action (if any) ────────────────────────────────────────
         if (action != ACTION_NO_ACTION) {
             NimBLERemoteCharacteristic *pAct =
                 pSvc->getCharacteristic(UUID_CHLORINATOR_APP_ACTION);
@@ -456,7 +448,6 @@ static bool ble_operate(ChlorinatorAction action) {
             }
         }
 
-        // ── 7. Read state characteristic ──────────────────────────────────
         NimBLERemoteCharacteristic *pState =
             pSvc->getCharacteristic(UUID_CHLORINATOR_STATE);
         if (!pState || !pState->canRead()) {
@@ -470,18 +461,16 @@ static bool ble_operate(ChlorinatorAction action) {
             goto disconnect;
         }
 
-        // ── 8. Decrypt and parse ───────────────────────────────────────────
         uint8_t decrypted[CHAR_DATA_LEN];
         decrypt_characteristic((const uint8_t *)state_raw.data(), session_key, decrypted);
-        parse_chlorinator_state(decrypted, &g_state);
-        g_has_state = true;
+        parse_chlorinator_state(decrypted, out_state);
         success = true;
 
         tlog("[BLE] state: mode=%d priming=%s pump=%s cell=%s\n",
-            g_state.mode,
-            g_state.pump_priming   ? "ON"  : "OFF",
-            g_state.pump_operating ? "ON"  : "OFF",
-            g_state.cell_operating ? "ON"  : "OFF");
+            out_state->mode,
+            out_state->pump_priming   ? "ON"  : "OFF",
+            out_state->pump_operating ? "ON"  : "OFF",
+            out_state->cell_operating ? "ON"  : "OFF");
     }
 
 disconnect:
@@ -495,6 +484,46 @@ disconnect:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BLE task — polls the chlorinator independently of the main loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void ble_task(void *) {
+    static ChlorinatorState state{};
+    unsigned long mqtt_last_seen = 0;  // millis() timestamp of last MQTT connection
+
+    while (true) {
+        // Pause during OTA — wait for main loop to signal completion
+        if (g_ota_in_progress.load()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // Block until an action arrives or the poll interval elapses
+        int action = ACTION_NO_ACTION;
+        xQueueReceive(g_action_queue, &action, pdMS_TO_TICKS(POLL_INTERVAL_MS));
+
+        if (g_mqtt_connected.load()) {
+            mqtt_last_seen = millis();
+        }
+
+        if (ble_operate((ChlorinatorAction)action, &state)) {
+            // Fallback: force Auto on next poll if MQTT has been absent for 30+ minutes
+            bool mqtt_absent_30min = mqtt_last_seen != 0 &&
+                                     millis() - mqtt_last_seen >= 30UL * 60 * 1000;
+            if (state.mode != MODE_AUTO && mqtt_absent_30min) {
+                int fallback = ACTION_AUTO;
+                xQueueOverwrite(g_action_queue, &fallback);
+            }
+        } else {
+            state.mode = MODE_BLE_ERROR;
+        }
+        xQueueOverwrite(g_state_queue, &state);
+    }
+
+    vTaskDelete(nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // OTA: receive firmware over the log TCP connection and flash it
 //
 // Protocol (text command line + raw binary):
@@ -505,29 +534,29 @@ disconnect:
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void handle_ota(size_t fw_size) {
-    g_ota_in_progress = true;
+    g_ota_in_progress.store(true);
     tlog("[OTA] starting, %u bytes\n", (unsigned)fw_size);
 
     if (!Update.begin(fw_size)) {
         tlog("[OTA] ERROR: begin failed: %s\n", Update.errorString());
         s_log_client.println("ERROR: Update.begin failed");
-        g_ota_in_progress = false;
+        g_ota_in_progress.store(false);
         return;
     }
 
     s_log_client.println("READY");
 
     uint8_t buf[512];
-    size_t  written    = 0;
-    unsigned int last_pct   = 0;
-    unsigned long last_data = millis();
+    size_t  written      = 0;
+    unsigned int last_pct    = 0;
+    unsigned long last_data  = millis();
 
     while (written < fw_size) {
         if (millis() - last_data > 30000) {
             tlog("[OTA] ERROR: timeout\n");
             s_log_client.println("ERROR: timeout");
             Update.abort();
-            g_ota_in_progress = false;
+            g_ota_in_progress.store(false);
             return;
         }
 
@@ -559,7 +588,7 @@ static void handle_ota(size_t fw_size) {
     } else {
         tlog("[OTA] ERROR: %s\n", Update.errorString());
         s_log_client.printf("ERROR: %s\n", Update.errorString());
-        g_ota_in_progress = false;
+        g_ota_in_progress.store(false);
     }
 }
 
@@ -568,7 +597,6 @@ static void handle_ota(size_t fw_size) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void service_log_server() {
-    // Accept a new client; only one at a time
     if (s_log_server.hasClient()) {
         if (s_log_client && s_log_client.connected()) {
             s_log_client.stop();
@@ -579,14 +607,12 @@ static void service_log_server() {
 
     if (!s_log_client || !s_log_client.connected()) return;
 
-    // Accumulate incoming bytes into a line buffer and parse commands
     static char s_cmd[64];
     static int  s_cmd_len = 0;
 
     while (s_log_client.available()) {
         char c = (char)s_log_client.read();
         if (c == '\n') {
-            // Strip trailing \r
             if (s_cmd_len > 0 && s_cmd[s_cmd_len - 1] == '\r') s_cmd_len--;
             s_cmd[s_cmd_len] = '\0';
 
@@ -610,9 +636,6 @@ static void service_log_server() {
 // Arduino setup
 // ─────────────────────────────────────────────────────────────────────────────
 
-// XIAO ESP32C6: user LED on GPIO15, active low
-#define PIN_LED 15
-
 void setup() {
     Serial.begin(115200);
 
@@ -623,10 +646,14 @@ void setup() {
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, HIGH);  // off
 
+    // Create sync primitives before first tlog() call
+    g_log_mutex    = xSemaphoreCreateMutex();
+    g_action_queue = xQueueCreate(1, sizeof(int));
+    g_state_queue  = xQueueCreate(1, sizeof(ChlorinatorState));
+
     delay(500);
     tlog("\n[SYS] Chlorinator BLE/MQTT Gateway (ESP32) starting\n");
 
-    // Build lowercase topic strings
     str_to_lower(CHLORINATOR_NAME, s_name_lower, sizeof(s_name_lower));
     snprintf(s_topic_state,     sizeof(s_topic_state),
              "chlorinator/%s/state",  s_name_lower);
@@ -640,7 +667,6 @@ void setup() {
     tlog("[SYS] state  topic: %s\n", s_topic_state);
     tlog("[SYS] action topic: %s\n", s_topic_action);
 
-    // WiFi – event handler gives us IP on connect and reason code on failure
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
         switch (event) {
             case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -660,61 +686,27 @@ void setup() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     tlog("[WiFi] connecting to %s ...\n", WIFI_SSID);
 
-    // MQTT
     s_mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     s_mqtt.setCallback(on_mqtt_message);
-    s_mqtt.setBufferSize(4096);   // Needed for the autodiscovery payload
-    s_mqtt.setKeepAlive(60);      // Generous keepalive – BLE can block the loop
+    s_mqtt.setBufferSize(4096);
+    s_mqtt.setKeepAlive(15);  // Tight keepalive is now safe — loop() is never blocked by BLE
 
-    // BLE (NimBLE stack – lighter than BlueDroid, coexists better with WiFi)
     NimBLEDevice::init("");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power for range
 
     tlog("[SYS] WiFi MAC : %s\n", WiFi.macAddress().c_str());
     tlog("[SYS] BLE  MAC : %s\n", NimBLEDevice::getAddress().toString().c_str());
+
+    xTaskCreate(ble_task, "ble_task", 8192, nullptr, 1, &g_ble_task_handle);
     tlog("[SYS] setup complete\n");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Arduino loop
+// Arduino loop — WiFi, MQTT, log/OTA server, LED heartbeat, state publishing
 // ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
-    // ── Maintain WiFi ────────────────────────────────────────────────────────
-    if (WiFi.status() != WL_CONNECTED) {
-        static unsigned long s_wifi_check = 0;
-        if (millis() - s_wifi_check >= 5000) {
-            s_wifi_check = millis();
-            tlog("[WiFi] not connected, waiting...\n");
-        }
-        delay(100);
-        return;
-    }
-
-    // ── Start log server once WiFi is up ─────────────────────────────────────
     static bool s_server_started = false;
-    if (!s_server_started) {
-        s_log_server.begin();
-        tlog("[SYS] log/OTA server on port 23\n");
-        s_server_started = true;
-    }
-
-    // ── Service log clients and handle OTA commands ──────────────────────────
-    service_log_server();
-
-    // ── OTA takes priority — skip MQTT and BLE while updating ────────────────
-    if (g_ota_in_progress) {
-        delay(10);
-        return;
-    }
-
-    // ── Maintain MQTT ────────────────────────────────────────────────────────
-    if (!s_mqtt.connected()) {
-        mqtt_reconnect();
-        delay(100);
-        return;
-    }
-    s_mqtt.loop();
 
     // ── Heartbeat LED — toggle once per second ───────────────────────────────
     static unsigned long s_led_toggle = 0;
@@ -725,39 +717,61 @@ void loop() {
         digitalWrite(PIN_LED, s_led_state ? LOW : HIGH);
     }
 
-    // ── Periodic heap logging ────────────────────────────────────────────────
+    // ── Periodic heap / stack logging ────────────────────────────────────────
     static unsigned long s_heap_log = 0;
     if (millis() - s_heap_log >= 30000) {
         s_heap_log = millis();
-        tlog("[SYS] free heap: %u bytes\n", esp_get_free_heap_size());
+        tlog("[SYS] free heap: %u  loop HWM: %u  BLE HWM: %u\n",
+             esp_get_free_heap_size(),
+             uxTaskGetStackHighWaterMark(NULL),
+             uxTaskGetStackHighWaterMark(g_ble_task_handle));
     }
 
-    // ── Periodic BLE polling ─────────────────────────────────────────────────
-    static unsigned long s_next_poll = 0;
-    bool pending = (g_pending_action != ACTION_NO_ACTION);
-    bool due     = (millis() >= s_next_poll);
-
-    if (!due && !pending) {
-        delay(10);
+    // ── Maintain WiFi ────────────────────────────────────────────────────────
+    if (WiFi.status() != WL_CONNECTED) {
+        g_mqtt_connected.store(false);
+        if (s_mqtt.connected()) {
+            s_mqtt.disconnect();
+        }
+        if (s_server_started) {
+            s_log_client.stop();
+            s_log_server.end();
+            s_server_started = false;
+        }
+        static unsigned long s_wifi_check = 0;
+        if (millis() - s_wifi_check >= 5000) {
+            s_wifi_check = millis();
+            tlog("[WiFi] not connected, waiting...\n");
+        }
         return;
     }
 
-    // Snapshot and clear the pending action atomically
-    ChlorinatorAction action = (ChlorinatorAction)g_pending_action;
-    g_pending_action = ACTION_NO_ACTION;
-    s_next_poll = millis() + POLL_INTERVAL_MS;
-
-    // Python fallback: if disconnected from MQTT keep device in Auto mode
-    // (here MQTT is always connected at this point, but mirror the intent)
-    if (action == ACTION_NO_ACTION && g_has_state &&
-        g_state.mode != MODE_AUTO && !s_mqtt.connected()) {
-        action = ACTION_AUTO;
+    // ── Start log server once WiFi is up ─────────────────────────────────────
+    if (!s_server_started) {
+        s_log_server.begin();
+        tlog("[SYS] log/OTA server on port 23\n");
+        s_server_started = true;
     }
 
-    bool ok = ble_operate(action);
-    if (ok) {
-        publish_state();
-    } else {
-        publish_error("BLE operation failed");
+    // ── Service log clients and handle OTA commands ──────────────────────────
+    service_log_server();
+
+    // ── Maintain MQTT ────────────────────────────────────────────────────────
+    if (!s_mqtt.connected()) {
+        g_mqtt_connected.store(false);
+        mqtt_reconnect();
+        return;
+    }
+    s_mqtt.loop();
+    g_mqtt_connected.store(true);
+
+    // ── Publish state or error from BLE task results ─────────────────────────
+    static ChlorinatorState new_state;
+    if (xQueueReceive(g_state_queue, &new_state, 0) == pdTRUE) {
+        if (new_state.mode == MODE_BLE_ERROR) {
+            publish_error("BLE operation failed");
+        } else {
+            publish_state(new_state);
+        }
     }
 }

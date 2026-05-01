@@ -12,9 +12,10 @@
 // ─── Enumerations ────────────────────────────────────────────────────────────
 
 typedef enum {
-    MODE_OFF    = 0,
-    MODE_MANUAL = 1,
-    MODE_AUTO   = 2,
+    MODE_BLE_ERROR = -1,  // sentinel: BLE operation failed, posted via state queue
+    MODE_OFF       = 0,
+    MODE_MANUAL    = 1,
+    MODE_AUTO      = 2,
 } ChlorinatorMode;
 
 typedef enum {
