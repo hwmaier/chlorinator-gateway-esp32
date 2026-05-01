@@ -112,9 +112,15 @@ static void publish_state() {
     doc["cell_is_operating"]                      = g_state.cell_operating;
     doc["sanitising_until_next_timer_tomorrow"]   = g_state.sanitising_tomorrow;
 
-    char buf[512];
-    serializeJson(doc, buf, sizeof(buf));
+    size_t len = measureJson(doc);
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) {
+        tlog("[MQTT] publish_state: malloc failed\n");
+        return;
+    }
+    serializeJson(doc, buf, len + 1);
     s_mqtt.publish(s_topic_state, buf, /*retain=*/false);
+    free(buf);
     tlog("[MQTT] state published\n");
 }
 
@@ -259,12 +265,13 @@ static void publish_autodiscovery() {
     }
 
     // Serialise and publish with retain=true
-    char *buf = (char *)malloc(4096);
+    size_t len = measureJson(doc);
+    char *buf = (char *)malloc(len + 1);
     if (!buf) {
         tlog("[MQTT] autodiscovery: malloc failed\n");
         return;
     }
-    size_t len = serializeJson(doc, buf, 4096);
+    serializeJson(doc, buf, len + 1);
     s_mqtt.publish(s_topic_discovery, (const uint8_t *)buf, (unsigned int)len, /*retain=*/true);
     tlog("[MQTT] autodiscovery published (%d bytes)\n", (int)len);
     free(buf);
@@ -603,12 +610,18 @@ static void service_log_server() {
 // Arduino setup
 // ─────────────────────────────────────────────────────────────────────────────
 
+// XIAO ESP32C6: user LED on GPIO15, active low
+#define PIN_LED 15
+
 void setup() {
     Serial.begin(115200);
 
     // XIAO ESP32C6: GPIO14 selects antenna — HIGH = external u.FL, LOW = built-in ceramic
     pinMode(14, OUTPUT);
     digitalWrite(14, HIGH);
+
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, HIGH);  // off
 
     delay(500);
     tlog("\n[SYS] Chlorinator BLE/MQTT Gateway (ESP32) starting\n");
@@ -702,6 +715,22 @@ void loop() {
         return;
     }
     s_mqtt.loop();
+
+    // ── Heartbeat LED — toggle once per second ───────────────────────────────
+    static unsigned long s_led_toggle = 0;
+    static bool s_led_state = false;
+    if (millis() - s_led_toggle >= 1000) {
+        s_led_toggle = millis();
+        s_led_state = !s_led_state;
+        digitalWrite(PIN_LED, s_led_state ? LOW : HIGH);
+    }
+
+    // ── Periodic heap logging ────────────────────────────────────────────────
+    static unsigned long s_heap_log = 0;
+    if (millis() - s_heap_log >= 30000) {
+        s_heap_log = millis();
+        tlog("[SYS] free heap: %u bytes\n", esp_get_free_heap_size());
+    }
 
     // ── Periodic BLE polling ─────────────────────────────────────────────────
     static unsigned long s_next_poll = 0;
